@@ -1,0 +1,195 @@
+import telebot
+import requests
+import json
+from bs4 import BeautifulSoup
+import logging
+import re
+
+# Конфигурация
+BOT_TOKEN = '8163030915:AAF8WsV_Fwx86ocQ2MGYxNZtN0gLyEnLCPE'
+OLLAMA_API_URL = 'http://localhost:11434/api/generate'
+MAX_TEXT_LENGTH = 3000
+
+# Логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler('bot.log', encoding='utf-8'), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+def get_article_text(url):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for tag in soup(['script', 'style', 'meta', 'link', 'noscript']):
+            tag.decompose()
+        text = soup.get_text(separator='\n').strip()
+        return text[:MAX_TEXT_LENGTH]
+    except Exception as e:
+        logger.error(f"Ошибка при получении статьи: {e}")
+        return None
+
+def filter_russian_reasons(reasons):
+    # Оставляем только причины, содержащие кириллицу
+    return [r for r in reasons if re.search('[а-яА-Я]', r)]
+
+def analyze_article_with_qwen(url):
+    article_text = get_article_text(url)
+    if not article_text:
+        return {"error": "Не удалось получить или обработать текст статьи"}
+
+    prompt = f"""
+Ты - эксперт по фактчекингу. Всегда отвечай ТОЛЬКО на русском языке, даже если статья на другом языке.
+
+Проанализируй статью и оцени вероятность того, что она фейковая, в процентах от 0 до 100.
+Ответь строго одним JSON-объектом на русском языке с двумя полями:
+- "fake_probability": число (0-100) - вероятность, что статья фейковая,
+- "reasons": список строк - краткие причины на русском, почему ты так решил.
+
+Пример ответа:
+{{"fake_probability": 75, "reasons": ["Подозрительные источники", "Отсутствие ссылок на официальные данные"]}}
+
+Распределение вероятности:
+- 0-20% - статья правдивая
+- 21-60% - в статье есть доля фейка
+- 61-100% - статья является фейком
+
+Текст статьи:
+{article_text}
+"""
+
+    try:
+        data = {
+            "prompt": prompt,
+            "model": "qwen2.5",
+            "format": "json",
+            "options": {"temperature": 0.0}
+        }
+        response = requests.post(OLLAMA_API_URL, json=data, timeout=45, stream=True)
+        response.raise_for_status()
+
+        # Сборка всех частей поля "response" из каждого JSON-объекта
+        full_response_text = ""
+        for line in response.iter_lines(decode_unicode=True):
+            if not line.strip():
+                continue
+            try:
+                chunk = json.loads(line)
+                if "response" in chunk:
+                    full_response_text += chunk["response"]
+                if chunk.get("done", False):
+                    break
+            except Exception as ex:
+                logger.warning(f"Ошибка чтения чанка: {ex}")
+                continue
+
+        logger.info(f"Собранный ответ модели: {full_response_text}")
+
+        # Теперь пытаемся распарсить собранный текст как JSON
+        response_json = json.loads(full_response_text)
+
+        # Проверяем поля
+        if "fake_probability" not in response_json or "reasons" not in response_json:
+            logger.warning(f"Неполный JSON ответ: {full_response_text}")
+            return handle_incomplete_json(full_response_text)
+
+        fake_probability = float(response_json["fake_probability"])
+        reasons = response_json.get("reasons", [])
+
+        # Фильтруем причины: только на русском
+        reasons = filter_russian_reasons(reasons)
+
+        if not (0 <= fake_probability <= 100):
+            logger.warning(f"Неверное значение fake_probability: {fake_probability}")
+            return handle_incomplete_json(full_response_text)
+
+        if not isinstance(reasons, list):
+            reasons = []
+
+        return {"fake_probability": fake_probability, "reasons": reasons}
+
+    except requests.RequestException as e:
+        logger.error(f"Ошибка запроса к Ollama API: {e}")
+        return {"error": "Ошибка запроса к Ollama API"}
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка парсинга JSON: {e}")
+        return handle_json_decode_error(full_response_text)
+    except Exception as e:
+        logger.error(f"Другая ошибка: {e}")
+        return {"error": str(e)}
+
+def handle_incomplete_json(response_text):
+    match = re.search(r'(\d{1,3})', response_text)
+    if match:
+        prob = int(match.group(1))
+        prob = max(0, min(100, prob))
+        return {
+            "fake_probability": prob,
+            "reasons": ["Не удалось точно распарсить JSON, использовано эвристическое значение"]
+        }
+    return {
+        "fake_probability": 50,
+        "reasons": ["Не удалось распарсить ответ модели, возвращено значение по умолчанию"]
+    }
+
+def handle_json_decode_error(response_text):
+    return {
+        "fake_probability": 50,
+        "reasons": ["Не удалось распарсить ответ модели, возвращено значение по умолчанию"]
+    }
+
+def interpret_probability(prob):
+    if prob <= 20:
+        return "✅ Статья правдивая"
+    elif prob <= 60:
+        return "⚠️ В статье есть доля фейка"
+    else:
+        return "🚨 Статья является фейком"
+
+def format_response(data):
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    prob = data.get("fake_probability")
+    reasons = data.get("reasons", [])
+
+    if prob is None:
+        return "Ошибка: не удалось определить вероятность."
+
+    description = interpret_probability(prob)
+
+    reasons_text = ""
+    if reasons:
+        reasons_text = "\n\nПричины:\n" + "\n".join(f"- {r}" for r in reasons)
+    else:
+        reasons_text = "\n\nПричины не указаны."
+
+    return f"{description}\n\nВероятность фейка: {prob:.0f}%{reasons_text}"
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.send_message(message.chat.id,
+                     "Привет! Отправь мне ссылку на новость, и я проанализирую её на предмет достоверности.")
+
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    url = message.text.strip()
+    if not url.startswith("http"):
+        bot.reply_to(message, "Пожалуйста, отправьте корректный URL.")
+        return
+
+    bot.send_chat_action(message.chat.id, 'typing')
+    analysis = analyze_article_with_qwen(url)
+    response_text = format_response(analysis)
+    bot.reply_to(message, response_text)
+
+if __name__ == '__main__':
+    logger.info("Запуск бота...")
+    bot.polling()
